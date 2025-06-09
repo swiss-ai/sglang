@@ -1,11 +1,15 @@
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Type, Set
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import SwissAIConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.activation import XIELU
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -18,13 +22,20 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    kv_cache_scales_loader,
+    maybe_remap_kv_scale_name,
+)
+from sglang.srt.utils import add_prefix, make_layers
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +72,7 @@ class SwissAIMLP(nn.Module):
             )
         self.act_fn = XIELU()
 
-    def forward(self, x):
+    def forward(self, x, forward_batch=None):
         # note: with xielu, there's no gate_proj
         x, _ = self.up_proj(x)
         x = self.act_fn(x)
@@ -132,9 +143,6 @@ class SwissAIAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "swissai":
-            rope_is_neox_style = False
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
@@ -143,15 +151,13 @@ class SwissAIAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
         )
-
-        sliding_window = None
-
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -191,6 +197,7 @@ class SwissAIDecoderLayer(nn.Module):
             rope_scaling["original_max_position_embeddings"] = (
                 config.original_max_position_embeddings
             )
+        rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
         # Support internlm/internlm-7b with bias
@@ -209,6 +216,7 @@ class SwissAIDecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
@@ -258,52 +266,112 @@ class SwissAIModel(nn.Module):
         self,
         config: SwissAIConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.quant_config = quant_config
         self.config = config
+        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.org_vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
-        self.layers = nn.ModuleList(
-            [
-                SwissAIDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
-                )
-                for i in range(config.num_hidden_layers)
-            ]
+        self.pp_group = get_pp_group()
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: SwissAIDecoderLayer(
+                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix="model.layers",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture = []
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: ForwardBatch,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
-        for i in range(len(self.layers)):
+            assert pp_proxy_tensors is not None
+            # FIXME(@ying): reduce the number of proxy tensors by not fusing layer norms
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+            deferred_norm = None
+
+        aux_hidden_states = []
+        for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                input_metadata,
+                forward_batch,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
+
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Thus, handled exceptions should
+    # make sure to leave KV cache scale factors in a known good (dummy) state
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+            quantization_param_path,
+            tp_rank,
+            tp_size,
+            self.config.num_hidden_layers,
+            self.config.__class__.model_type,
+        ):
+            if not isinstance(self.layers[layer_idx], nn.Identity):
+                layer_self_attn = self.layers[layer_idx].self_attn
+
+            if hasattr(layer_self_attn.attn, "k_scale"):
+                layer_self_attn.attn.k_scale = scaling_factor
+                layer_self_attn.attn.v_scale = scaling_factor
+            else:
+                raise RuntimeError(
+                    "Self attention has no KV cache scaling " "factor attribute!"
+                )
 
 
 class SwissAIForCausalLM(nn.Module):
@@ -313,46 +381,110 @@ class SwissAIForCausalLM(nn.Module):
         "lm_head": "output_embeddings",
     }
     embedding_padding_modules = ["lm_head"]
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    # in TP, these weights are partitioned along the column dimension (dim=-1)
+    column_parallel_weights_modules = [".down_proj.", ".o_proj."]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        ".q_proj": (".qkv_proj", 0),
+        ".k_proj": (".qkv_proj", 1),
+        ".v_proj": (".qkv_proj", 2),
+    }
 
     def __init__(
         self,
         config: SwissAIConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = SwissAIModel(config, quant_config=quant_config)
+        self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=quant_config
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id, num_shard)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
+
+        self.capture_aux_hidden_states = False
+
+    def _init_model(
+        self,
+        config: SwissAIConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        return SwissAIModel(config, quant_config=quant_config, prefix=prefix)
 
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: ForwardBatch,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(
-            input_ids, positions, input_metadata, input_embeds
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, input_metadata
-            )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, input_metadata)
+            return hidden_states
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def get_hidden_dim(self, module_name):
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
@@ -384,13 +516,7 @@ class SwissAIForCausalLM(nn.Module):
         return params_mapping.get(name, name)
 
     def get_module_name_from_weight_name(self, name):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
-        ]
-        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
+        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:
                 return (
                     name.replace(weight_name, param_name)[: -len(".weight")],
@@ -411,14 +537,33 @@ class SwissAIForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             # Handle FP8 kv-scale remapping
             if "scale" in name:
-                pass
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -435,13 +580,17 @@ class SwissAIForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+                # Skip loading kv_scale from ckpts towards new design.
+                if name.endswith(".kv_scale") and name not in params_dict:
+                    continue
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                else:
+                    logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -453,6 +602,24 @@ class SwissAIForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
 
 
 EntryClass = [SwissAIForCausalLM]
