@@ -63,7 +63,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `kv_cache_dtype` | Dtype of the kv cache. | `auto` |
 | `context_length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). Note that extending the default might lead to strange behavior. | None |
 | `device` | The device we put the model. | None |
-| `device` | The device we put the model. | None |
+| `impl` | The implementation of the model to use. Defaults to SGlang implementation and fall back to transformers if needed | `auto` |
 | `served_model_name` | Override the model name returned by the v1/models endpoint in OpenAI API server.| None |
 | `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
 | `revision` | Adjust if a specific version of the model should be used. | None |
@@ -100,7 +100,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|---------|
-| `dp_size` | Will be deprecated. The number of data-parallel copies of the model. [SGLang router](../router/router.md) is recommended instead of the current naive data parallel. | `1` |
+| `dp_size` | For non-DeepSeek models, this is the the number of data-parallel copies of the model. For DeepSeek models, this is the group size of [data parallel attention](https://docs.sglang.ai/references/deepseek.html#data-parallelism-attention) on DeepSeek models. | `1` |
 | `load_balance_method` | Will be deprecated. Load balancing strategy for data parallel requests. | `"round_robin"` |
 
 ### Expert parallelism
@@ -122,7 +122,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `chunked_prefill_size` | Perform prefill in chunks of this size. Larger sizes speed up prefill but increase VRAM usage. Decrease if CUDA runs out of memory. | None |
 | `max_prefill_tokens` | Token budget for how many tokens can be accepted in one prefill batch. The actual limit is the max of this value and `context_length`. | `16384` |
 | `schedule_policy` | The scheduling policy to control how waiting prefill requests are processed by a single engine. | `"fcfs"` |
-| `schedule_conservativeness` | Controls how conservative the server is when accepting new requests. High conservativeness may cause starvation; low conservativeness may reduce performance. | `1.0` |
+| `schedule_conservativeness` | Controls how conservative the server is when accepting new prefill requests. High conservativeness may cause starvation; low conservativeness may slow down decode. | `1.0` |
 | `cpu_offload_gb` | Amount of RAM (in GB) to reserve for offloading model parameters to the CPU. | `0` |
 
 ## Other runtime options
@@ -160,16 +160,17 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `lora_paths` | List of adapters to apply to your model. Each batch element uses the proper LoRA adapter. `cuda_graph` and `radix_attention` are not supported with this, so they must be disabled manually. See related [issues](https://github.com/sgl-project/sglang/issues/2929). | None |
+| `lora_paths` | List of adapters to apply to your model. Each batch element uses the proper LoRA adapter. `radix_attention` is not supported with this, so it must be disabled manually. See related [issues](https://github.com/sgl-project/sglang/issues/2929). | None |
 | `max_loras_per_batch` | Maximum number of LoRAs allowed in a running batch, including the base model. | `8` |
 | `lora_backend` | Backend used to run GEMM kernels for LoRA modules. Can be `triton` or `flashinfer`. | `triton` |
 
 ## Kernel backend
 
-| Arguments | Description | Defaults |
-|----------|-------------|---------|
-| `attention_backend` | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
-| `sampling_backend` | Specifies the backend used for sampling. | None |
+| Arguments              | Description | Defaults |
+|------------------------|-------------|---------|
+| `attention_backend`    | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
+| `sampling_backend`     | Specifies the backend used for sampling. | None |
+| `mm_attention_backend` | Set multimodal attention backend.
 
 ## Constrained Decoding
 
@@ -200,6 +201,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `disable_cuda_graph_padding` | Disable CUDA Graph when padding is needed; otherwise, still use CUDA Graph. | `False` |
 | `disable_outlines_disk_cache` | Disable disk cache for outlines grammar backend. | `False` |
 | `disable_custom_all_reduce` | Disable usage of custom all-reduce kernel. | `False` |
+| `enable_mscclpp` | Enable usage of mscclpp kernel for small message all-reduce. | `False` |
 | `disable_overlap_schedule` | Disable the [Overhead-Scheduler](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#zero-overhead-batch-scheduler). | `False` |
 | `enable_nan_detection` | Enable warning if the logits contain `NaN`. | `False` |
 | `enable_p2p_check` | Turns off the default of always allowing P2P checks when accessing GPU. | `False` |
@@ -219,5 +221,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `cuda_graph_bs` | The batch sizes to capture by `CudaGraphRunner`. By default this is done for you. | None |
 | `torchao_config` | Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. | `int8dq` |
 | `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
-| `flashinfer_mla_disable_ragged` | Disable the use of the ragged prefill wrapper for the FlashInfer MLA attention backend. Only use it when FlashInfer is being used as the MLA backend. | `False` |
+| `flashinfer_mla_disable_ragged` | Disable the use of the [ragged prefill](https://github.com/flashinfer-ai/flashinfer/blob/5751fc68f109877f6e0fc54f674cdcdef361af56/docs/tutorials/kv_layout.rst#L26) wrapper for the FlashInfer MLA attention backend. Ragged prefill increases throughput by computing MHA instead of paged MLA when there is no prefix match. Only use it when FlashInfer is being used as the MLA backend. | `False` |
 | `disable_chunked_prefix_cache` | Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend. | `False` |
+| `enable_dp_lm_head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | `False` |

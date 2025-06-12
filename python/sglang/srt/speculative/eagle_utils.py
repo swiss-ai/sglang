@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
+    Req,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
@@ -31,15 +36,15 @@ if is_cuda():
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-import logging
 
 logger = logging.getLogger(__name__)
 
 
+# Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+
+TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
 
 @dataclass
@@ -81,8 +86,9 @@ class EagleDraftInput:
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int,
+        context_length: int,
+        pad_input: bool = False,
     ):
-        assert len(self.verified_id) == len(batch.out_cache_loc)
         accept_length_cpu = batch.spec_info.accept_length_cpu
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
@@ -107,6 +113,50 @@ class EagleDraftInput:
         batch.seq_lens_sum = sum(seq_lens_cpu)
         batch.input_ids = self.verified_id
         self.verified_id = new_verified_id
+
+        if not pad_input:
+            return
+
+        batch_size = sum(not req.finished() for req in batch.reqs)
+        # Total constant input length after padding
+        static_len = speculative_num_steps + 1
+        # Total size after padding
+        padded_input_size = batch_size * static_len
+
+        padded_len = padded_input_size - batch.input_ids.shape[0]
+        if padded_len > 0:
+            new_input_ids = torch.nn.functional.pad(
+                batch.input_ids, (0, padded_len), value=0
+            )
+            position_padding = torch.arange(padded_len, device=self.positions.device)
+            new_positions = torch.cat([self.positions, position_padding])
+
+            # need dummy hidden states for the padded positions
+            hidden_states_dim = self.hidden_states.shape[-1]
+            new_hidden_states = torch.cat(
+                [
+                    self.hidden_states,
+                    torch.zeros(
+                        (padded_len, hidden_states_dim),
+                        dtype=self.hidden_states.dtype,
+                        device=self.hidden_states.device,
+                    ),
+                ],
+                dim=0,
+            )
+
+            # allocate KV cache location for the padded tokens
+            padded_cache_loc = torch.zeros(
+                padded_len,
+                dtype=batch.out_cache_loc.dtype,
+                device=batch.out_cache_loc.device,
+            )
+            new_out_cache_loc = torch.cat([batch.out_cache_loc, padded_cache_loc])
+
+            batch.input_ids = new_input_ids
+            self.hidden_states = new_hidden_states
+            self.positions = new_positions
+            batch.out_cache_loc = new_out_cache_loc
 
     def generate_attn_arg_prefill(
         self,
@@ -167,12 +217,12 @@ class EagleVerifyOutput:
     draft_input: EagleDraftInput
     # Logit outputs from target worker
     logits_output: LogitsProcessorOutput
-    # Accepeted token ids including the bonus token
+    # Accepted token ids including the bonus token
     verified_id: torch.Tensor
-    # Accepeted token length per sequence in a batch in CPU.
+    # Accepted token length per sequence in a batch in CPU.
     accept_length_per_req_cpu: List[int]
-    # Accepeted indices from logits_output.next_token_logits
-    accepeted_indices: torch.Tensor
+    # Accepted indices from logits_output.next_token_logits
+    accepted_indices: torch.Tensor
 
 
 @dataclass
@@ -184,9 +234,11 @@ class EagleVerifyInput:
     retrive_next_token: torch.Tensor
     retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
-    draft_token_num: int
     spec_steps: int
+    topk: int
+    draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
+    grammar: BaseGrammarObject = None
 
     @classmethod
     def create(
@@ -221,16 +273,17 @@ class EagleVerifyInput:
         )
 
         return cls(
-            draft_tokens,
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            None,
-            num_verify_tokens,
-            spec_steps,
-            CaptureHiddenMode.FULL,
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=spec_steps,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
@@ -307,6 +360,7 @@ class EagleVerifyInput:
         logits_output: torch.Tensor,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
+        vocab_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -316,7 +370,7 @@ class EagleVerifyInput:
 
         This API updates values inside logits_output based on the accepted
         tokens. I.e., logits_output.next_token_logits only contains
-        accepeted token logits.
+        accepted token logits.
         """
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
@@ -341,6 +395,13 @@ class EagleVerifyInput:
             sampling_info.apply_logits_bias(linear_penalty)
             logits_output.next_token_logits.add_(
                 torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+            )
+
+        # Apply grammar mask
+        if vocab_mask is not None:
+            assert self.grammar is not None
+            self.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
         # Sample tokens
@@ -440,6 +501,15 @@ class EagleVerifyInput:
                     break
                 else:
                     new_accept_index_.append(idx)
+                    # update grammar state
+                    if req.grammar is not None:
+                        try:
+                            req.grammar.accept_token(id)
+                        except ValueError as e:
+                            logger.info(
+                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                            )
+                            raise e
             if not req.finished():
                 new_accept_index.extend(new_accept_index_)
                 unfinished_index.append(i)
@@ -493,7 +563,7 @@ class EagleVerifyInput:
                 logits_output=logits_output,
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_cpu,
-                accepeted_indices=accept_index,
+                accepted_indices=accept_index,
             )
         else:
             assign_req_to_token_pool[(bs,)](
@@ -539,7 +609,7 @@ class EagleVerifyInput:
                 logits_output=logits_output,
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_cpu,
-                accepeted_indices=accept_index,
+                accepted_indices=accept_index,
             )
 
 
@@ -801,3 +871,113 @@ def _generate_simulated_accept_index(
     accept_length.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
+
+
+def traverse_tree(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    grammar: BaseGrammarObject,
+    allocate_token_bitmask: torch.Tensor,
+):
+    """
+    Traverse the tree constructed by the draft model to generate the logits mask.
+    """
+    assert (
+        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
+    )
+
+    allocate_token_bitmask.fill_(0)
+
+    def dfs(
+        curr: int,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        parent_pos: int,
+    ):
+        if curr == 0:
+            # the first token generated by the target model, and thus it is always
+            # accepted from the previous iteration
+            accepted = True
+        else:
+            parent_bitmask = allocate_token_bitmask[parent_pos]
+            curr_token_id = draft_tokens[curr]
+            # 32 boolean bitmask values are packed into 32-bit integers
+            accepted = (
+                parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+            ) != 0
+
+        if accepted:
+            if curr != 0:
+                # Accept the current token
+                grammar.accept_token(draft_tokens[curr])
+            if not grammar.is_terminated():
+                # Generate the bitmask for the current token
+                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                if retrieve_next_token[curr] != -1:
+                    # Visit the child node
+                    dfs(
+                        retrieve_next_token[curr],
+                        retrieve_next_token,
+                        retrieve_next_sibling,
+                        curr,
+                    )
+
+            if curr != 0:
+                # Rollback the current token
+                grammar.rollback(1)
+
+        if retrieve_next_sibling[curr] != -1:
+            # Visit the sibling node
+            dfs(
+                retrieve_next_sibling[curr],
+                retrieve_next_token,
+                retrieve_next_sibling,
+                parent_pos,
+            )
+
+    dfs(0, retrieve_next_token, retrieve_next_sibling, -1)
+
+
+def generate_token_bitmask(
+    reqs: List[Req],
+    verify_input: EagleVerifyInput,
+    retrieve_next_token_cpu: torch.Tensor,
+    retrieve_next_sibling_cpu: torch.Tensor,
+    draft_tokens_cpu: torch.Tensor,
+    vocab_size: int,
+):
+    """
+    Generate the logit mask for structured output.
+    Draft model's token can be either valid or invalid with respect to the grammar.
+    We need to perform DFS to figure out:
+    1. which tokens are accepted by the grammar
+    2. what is the corresponding logit mask.
+    """
+
+    num_draft_tokens = draft_tokens_cpu.shape[-1]
+
+    allocate_token_bitmask = None
+    assert len(reqs) == retrieve_next_token_cpu.shape[0]
+    grammar = None
+    for i, req in enumerate(reqs):
+        if req.grammar is not None:
+            if allocate_token_bitmask is None:
+                allocate_token_bitmask = req.grammar.allocate_vocab_mask(
+                    vocab_size=vocab_size,
+                    batch_size=draft_tokens_cpu.numel(),
+                    device="cpu",
+                )
+            grammar = req.grammar
+            traverse_tree(
+                retrieve_next_token_cpu[i],
+                retrieve_next_sibling_cpu[i],
+                draft_tokens_cpu[i],
+                req.grammar,
+                allocate_token_bitmask[
+                    i * num_draft_tokens : (i + 1) * num_draft_tokens
+                ],
+            )
+
+    verify_input.grammar = grammar
+    return allocate_token_bitmask

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import platform
 import sys
 import platform
 from pathlib import Path
