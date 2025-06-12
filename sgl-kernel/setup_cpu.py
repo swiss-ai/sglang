@@ -13,17 +13,31 @@
 # limitations under the License.
 # ==============================================================================
 
-import platform
+import os
+import shutil
 import sys
 import platform
 from pathlib import Path
 
+import torch
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from setuptools.command.build_py import build_py
+from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 root = Path(__file__).parent.resolve()
 arch = platform.machine().lower()
 
+if arch in ("x86_64", "amd64"):
+    plat_name = "manylinux2014_x86_64"
+elif arch in ("aarch64", "arm64"):
+    plat_name = "manylinux2014_aarch64"
+elif arch.startswith("ppc"):
+    plat_name = "manylinux2014_ppc64le"
+else:
+    plat_name = f"manylinux2014_{arch}"
+
+if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
+    sys.argv.extend(["--plat-name", plat_name])
 
 def _get_version():
     with open(root / "pyproject.toml") as f:
@@ -33,48 +47,50 @@ def _get_version():
 
 
 operator_namespace = "sgl_kernel"
-include_dirs = [
-    root / "include",
-    root / "csrc",
-]
+include_dirs = []
 
 sources = [
-    "csrc/allreduce/custom_all_reduce.hip",
-    "csrc/moe/moe_align_kernel.cu",
-    "csrc/moe/moe_topk_softmax_kernels.cu",
-    "csrc/torch_extension_rocm.cc",
-    "csrc/speculative/eagle_utils.cu",
+    "csrc/cpu/activation.cpp",
+    "csrc/cpu/bmm.cpp",
+    "csrc/cpu/decode.cpp",
+    "csrc/cpu/extend.cpp",
+    "csrc/cpu/gemm.cpp",
+    "csrc/cpu/gemm_int8.cpp",
+    "csrc/cpu/moe.cpp",
+    "csrc/cpu/moe_int8.cpp",
+    "csrc/cpu/norm.cpp",
+    "csrc/cpu/qkv_proj.cpp",
+    "csrc/cpu/topk.cpp",
+    "csrc/cpu/interface.cpp",
+    "csrc/cpu/shm.cpp",
+    "csrc/cpu/torch_extension_cpu.cpp",
 ]
 
-cxx_flags = ["-O3"]
-libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
+extra_compile_args = {
+    "cxx": [
+        "-O3",
+        "-Wno-unknown-pragmas",
+        "-march=native",
+        "-fopenmp",
+    ]
+}
+libraries = ["c10", "torch", "torch_python"]
+cmdclass = {
+    "build_ext": BuildExtension.with_options(use_ninja=True),
+}
+Extension = CppExtension
+
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-hipcc_flags = [
-    "-DNDEBUG",
-    f"-DOPERATOR_NAMESPACE={operator_namespace}",
-    "-O3",
-    "-Xcompiler",
-    "-fPIC",
-    "-std=c++17",
-    "-D__HIP_PLATFORM_AMD__=1",
-    "--amdgpu-target=gfx942",
-    "-DENABLE_BF16",
-    "-DENABLE_FP8",
-]
-
 ext_modules = [
-    CUDAExtension(
+    Extension(
         name="sgl_kernel.common_ops",
         sources=sources,
         include_dirs=include_dirs,
-        extra_compile_args={
-            "nvcc": hipcc_flags,
-            "cxx": cxx_flags,
-        },
+        extra_compile_args=extra_compile_args,
         libraries=libraries,
         extra_link_args=extra_link_args,
-        py_limited_api=False,
+        py_limited_api=True,
     ),
 ]
 
@@ -84,6 +100,7 @@ setup(
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+    cmdclass=cmdclass,
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
+
