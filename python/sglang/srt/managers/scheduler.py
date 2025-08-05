@@ -203,6 +203,7 @@ class Scheduler(
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
+        self.disable_jump_forward = server_args.disable_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -272,6 +273,9 @@ class Scheduler(
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
+
+        if self.enable_overlap:
+            self.disable_jump_forward = True
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
@@ -1534,6 +1538,14 @@ class Scheduler(
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
+
+        # Check for jump-forward
+        if not self.disable_jump_forward and batch.has_grammar:
+            jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
+            self._extend_requests_to_queue(jump_forward_reqs)
+            if batch.is_empty():
+                self.batch_is_full = False
+                return None
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False

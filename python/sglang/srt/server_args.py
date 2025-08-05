@@ -159,6 +159,7 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_nccl_nvls: bool = False
@@ -1145,6 +1146,11 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--disable-jump-forward",
+            action="store_true",
+            help="Disable jump-forward for grammar-guided decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph",

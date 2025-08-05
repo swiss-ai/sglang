@@ -461,6 +461,7 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         rids = []
+        vids = []
         finished_reasons: List[BaseFinishReason] = []
 
         decoded_texts = []
@@ -537,6 +538,7 @@ class SchedulerOutputProcessorMixin:
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
+                vids.append(req.vid)
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
@@ -651,6 +653,7 @@ class SchedulerOutputProcessorMixin:
                 BatchTokenIDOut(
                     rids,
                     finished_reasons,
+                    vids,
                     decoded_texts,
                     decode_ids_list,
                     read_offsets,

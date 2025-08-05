@@ -197,6 +197,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
 | `disable_radix_cache` | Disable [Radix](https://lmsys.org/blog/2024-01-17-sglang/) backend for prefix caching. | `False` |
+| `disable_jump_forward` | Disable jump-forward for grammar-guided decoding. | `False` |
 | `disable_cuda_graph` | Disable [CUDA Graph](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) for model forward. Use if encountering uncorrectable CUDA ECC errors. | `False` |
 | `disable_cuda_graph_padding` | Disable CUDA Graph when padding is needed; otherwise, still use CUDA Graph. | `False` |
 | `disable_outlines_disk_cache` | Disable disk cache for outlines grammar backend. | `False` |
