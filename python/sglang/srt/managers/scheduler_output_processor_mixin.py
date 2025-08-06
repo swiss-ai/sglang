@@ -166,7 +166,7 @@ class SchedulerOutputProcessorMixin:
 
             # Handle any injected tool tokens: advance grammar and clear pending_appends
             for req in batch.reqs:
-                if getattr(req, 'pending_appends', None):
+                if self.server_args.tool_response_accept_token and getattr(req, 'pending_appends', None):
                     for span in req.pending_appends:
                         for tid in span:
                             if req.grammar is not None:

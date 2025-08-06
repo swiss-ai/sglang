@@ -134,6 +134,8 @@ class ServerArgs:
     inline_tool: bool = False
     # Timeout in seconds to wait for tool response before returning an error
     tool_timeout: float = 10.0
+    # Whether to accept the inline-tool response in grammar
+    tool_response_accept_token: bool = False
 
     # Data parallelism
     dp_size: int = 1
@@ -1210,6 +1212,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.tool_timeout,
             help="Timeout in seconds to wait for tool response before returning an error",
+        )
+        parser.add_argument(
+            "--tool-response-accept-token",
+            action="store_true",
+            default=ServerArgs.tool_response_accept_token,
+            help="Accept the inline-tool response in grammar",
         )
 
         # Data parallelism

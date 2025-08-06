@@ -151,6 +151,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'. | None |
 | `--inline-tool` | Enable inline tool-call parsing with pause/resume in synchronous and asynchronous streaming modes (requires `--stream`). | False |
 | `--tool-timeout` | Timeout in seconds to wait for a tool response before returning an error in inline tool-call mode. | 10.0 |
+| `--tool-response-accept-token` | Accept the inline-tool response in grammar. | False |
 
 ## Data parallelism
 
