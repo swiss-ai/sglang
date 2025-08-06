@@ -32,6 +32,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
+import asyncio
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -846,6 +847,25 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
     ):
         """Process tool calls in streaming response"""
+        # If inline-tool is disabled, no parser configured, or no tools provided, skip inline logic
+        if (
+            not self.tokenizer_manager.server_args.inline_tool
+            or self.tokenizer_manager.server_args.tool_call_parser is None
+            or not request.tools
+        ):
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(content=delta),
+                finish_reason=None,
+            )
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
+            return
         if index not in parser_dict:
             parser_dict[index] = FunctionCallParser(
                 tools=request.tools,
@@ -853,9 +873,10 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         parser = parser_dict[index]
 
+        # Safe parse of tool calls
         normal_text, calls = parser.parse_stream_chunk(delta)
 
-        # Yield normal text
+        # Yield normal text first
         if normal_text:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
@@ -874,6 +895,16 @@ class OpenAIServingChat(OpenAIServingBase):
         for call_item in calls:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
+            if (
+                self.tokenizer_manager.server_args.inline_tool
+                and self.tokenizer_manager.server_args.tool_call_parser is not None
+                and request.tools
+            ):
+                rid = content["meta_info"]["id"]
+                evt = asyncio.Event()
+                self.tokenizer_manager._renqueue(rid, "resume", evt)
+                # Pause the scheduler for this sequence
+                await self.tokenizer_manager.pause_sequence(rid)
 
             # Tool call ID should be generated only once per tool call
             if call_item.name:
@@ -906,6 +937,48 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+            if (
+                self.tokenizer_manager.server_args.inline_tool
+                and self.tokenizer_manager.server_args.tool_call_parser is not None
+                and request.tools
+            ):
+                # Wait for the tool to call back and append its response
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=self.tokenizer_manager.server_args.tool_timeout)
+                except asyncio.TimeoutError:
+                    _ = self.tokenizer_manager._rpop(rid, "resume")
+                    # Append a timeout message and resume the sequence
+                    await self.tokenizer_manager.append_text_and_resume(rid, f"tool timeout after {self.tokenizer_manager.server_args.tool_timeout}s", role="tool")
+                    error_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(role="tool", content=f"tool timeout after {self.tokenizer_manager.server_args.tool_timeout}s"),
+                        finish_reason=None,
+                    )
+                    error_chunk = ChatCompletionStreamResponse(
+                        id=rid,
+                        created=int(time.time()),
+                        choices=[error_data],
+                        model=request.model,
+                    )
+                    yield f"data: {error_chunk.model_dump_json()}\n\n"
+                else:
+                    # Cleanup event now that the tool has resumed
+                    # Emit the buffered tool response
+                    role, content_text = self.tokenizer_manager._rpop(rid, "resp") or (None, None)
+                    if role and content_text is not None:
+                        tool_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(role=role, content=content_text),
+                            finish_reason=None,
+                        )
+                        tool_chunk = ChatCompletionStreamResponse(
+                            id=rid,
+                            created=int(time.time()),
+                            choices=[tool_data],
+                            model=request.model,
+                        )
+                        yield f"data: {tool_chunk.model_dump_json()}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,

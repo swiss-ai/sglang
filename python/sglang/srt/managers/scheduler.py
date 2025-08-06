@@ -2330,8 +2330,11 @@ class Scheduler(
             success = False
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
-
-        barrier()
+        # Only synchronize across processes when dp_size > 1
+        if self.server_args.dp_size > 1:
+            barrier()
+        else:
+            logger.debug(f"Skipping synchronization barrier: dp_size={self.server_args.dp_size} <= 1")
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):

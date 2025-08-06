@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
+from collections import deque, defaultdict
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -36,6 +36,7 @@ from typing import (
     Awaitable,
     Deque,
     Dict,
+    DefaultDict,
     Generic,
     List,
     Optional,
@@ -113,6 +114,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    RpcReqInput,
+    RpcReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -262,6 +265,16 @@ class TokenizerManager:
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
+        # Inline-tool RPC channel and unified per-rid state queues
+        rpc_context = zmq.Context()
+        self.send_to_rpc = get_zmq_socket(rpc_context, zmq.DEALER, port_args.rpc_ipc_name, True)
+        # Lock to protect RPC socket send/recv across threads
+        self._rpc_lock = threading.RLock()
+        # per-rid inline-tool queues: resume events and buffered responses
+        from threading import RLock
+        self._inline_state: DefaultDict[str, Dict[str, deque]] = defaultdict(lambda: {"resume": deque(), "resp": deque()})
+        # Lock to protect inline-tool state access
+        self._inline_state_lock = threading.RLock()
 
         # Request states
         self.no_create_loop = False
@@ -916,6 +929,7 @@ class TokenizerManager:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
+        # If no such request, nothing further to do
         if not abort_all and rid not in self.rid_to_state:
             return
         req = AbortReq(rid, abort_all)
@@ -923,6 +937,11 @@ class TokenizerManager:
 
         if self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request()
+        # Clean up any pending inline-tool state for this rid or all
+        if abort_all:
+            self._inline_state.clear()
+        else:
+            self._inline_state.pop(rid, None)
 
     async def start_profile(
         self,
@@ -1941,6 +1960,84 @@ class TokenizerManager:
             scores.append(score_list)
 
         return scores
+
+    # RPC helper for inline tool calls
+    def _rpc(self, req: RpcReqInput) -> RpcReqOutput:
+        # Protect RPC socket usage with a reentrant lock
+        with self._rpc_lock:
+            self.send_to_rpc.send_pyobj(req)
+            return self.send_to_rpc.recv_pyobj()
+
+    async def pause_sequence(self, rid: str, reason: str = "tool"):
+        """Pause a running sequence in the scheduler before tool execution."""
+        self.auto_create_handle_loop()
+        req = RpcReqInput(method="pause_sequence", parameters={"rid": rid, "reason": reason})
+        resp = await asyncio.to_thread(self._rpc, req)
+        if not resp.success:
+            raise RuntimeError(resp.message)
+        return resp
+
+    async def enqueue_append_tokens(self, rid: str, token_ids: List[int]):
+        """Queue token IDs to append into a paused request."""
+        self.auto_create_handle_loop()
+        req = RpcReqInput(method="enqueue_append_tokens", parameters={"rid": rid, "token_ids": token_ids})
+        resp = await asyncio.to_thread(self._rpc, req)
+        if not resp.success:
+            raise RuntimeError(resp.message)
+        return resp
+
+    async def resume_sequence(self, rid: str):
+        """Resume a previously paused sequence after appending tool output."""
+        self.auto_create_handle_loop()
+        req = RpcReqInput(method="resume_sequence", parameters={"rid": rid})
+        resp = await asyncio.to_thread(self._rpc, req)
+        if not resp.success:
+            raise RuntimeError(resp.message)
+        # Wake the next resume event
+        if evt := self._rpop(rid, "resume"):
+            evt.set()
+        return resp
+
+    async def append_text_and_resume(self, rid: str, text: Union[str, List[int]], *, role: str = None):
+        """Buffer the tool response text or IDs and resume the paused sequence."""
+        self.auto_create_handle_loop()
+        if isinstance(text, str):
+            token_ids = self.tokenizer.encode(text)
+            resp_text = text
+        else:
+            token_ids = text
+            resp_text = self.tokenizer.decode(text)
+        # Buffer role and content for the next resume
+        self._renqueue(rid, "resp", (role or "tool", resp_text))
+        # Enqueue tokens then resume scheduler
+        await self.enqueue_append_tokens(rid, token_ids)
+        await self.resume_sequence(rid)
+        return True
+
+    def _renqueue(self, rid: str, name: str, item):
+        """Append an item to the per-rid `<name>` queue."""
+        with self._inline_state_lock:
+            self._inline_state[rid][name].append(item)
+
+    def _rpop(self, rid: str, name: str):
+        """Pop and return next item from the per-rid `<name>` queue, or None."""
+        with self._inline_state_lock:
+            q = self._inline_state[rid][name]
+            if q:
+                elem = q.popleft()
+                # clean up empty state entry
+                if not self._inline_state[rid]["resume"] and not self._inline_state[rid]["resp"]:
+                    del self._inline_state[rid]
+                return elem
+            return None
+
+    def _cleanup_inline_state(self, rid: Optional[str] = None):
+        """Clear inline-tool state(s)."""
+        with self._inline_state_lock:
+            if rid:
+                self._inline_state.pop(rid, None)
+            else:
+                self._inline_state.clear()
 
 
 class ServerStatus(Enum):

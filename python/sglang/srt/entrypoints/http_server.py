@@ -21,12 +21,13 @@ import asyncio
 import dataclasses
 import json
 import logging
-import multiprocessing as multiprocessing
+import multiprocessing
 import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import AsyncIterator, Callable, Dict, Optional, List, Any, Literal
+from pydantic import BaseModel
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -792,6 +793,57 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     return await raw_request.app.state.openai_serving_embedding.handle_request(
         request, raw_request
     )
+
+
+class ResumeToolCallPayload(BaseModel):
+    text: str
+    role: Optional[str] = "tool"
+
+
+class ResumeToolCallResponse(BaseModel):
+    status: Literal["ok", "inline_tool_disabled"]
+
+
+@app.post(
+    "/v1/chat/completions/{rid}/resume",
+    response_model=ResumeToolCallResponse,
+    summary="Resume a paused inline tool sequence",
+    description="Resume a paused inline tool-call by appending the tool's output text and resuming the streaming response.",
+    tags=["inline-tools"],
+    dependencies=[Depends(validate_json_request)],
+)
+async def resume_tool_call(rid: str, payload: ResumeToolCallPayload, request: Request):
+    # Use the global tokenizer_manager
+    tm = _global_state.tokenizer_manager
+    # no-op if inline-tool disabled or no parser configured
+    if not tm.server_args.inline_tool or tm.server_args.tool_call_parser is None:
+        return ResumeToolCallResponse(status="inline_tool_disabled")
+    try:
+        await tm.append_text_and_resume(rid, payload.text, role=payload.role)
+    except Exception as e:
+        await tm.append_text_and_resume(rid, f"resume error: {e}", role=payload.role)
+    return ResumeToolCallResponse(status="ok")
+
+
+@app.on_event("shutdown")
+def _cleanup_inline_tool_state():
+    """Clear any pending inline-tool events and buffers on server shutdown."""
+    tm = _global_state.tokenizer_manager
+    # Signal all awaiting resume events so no tasks hang
+    for state_map in tm._inline_state.values():
+        for queue in state_map.values():
+            for evt in queue:
+                try:
+                    evt.set()
+                except:
+                    pass
+    # Clear inline-tool state
+    if hasattr(tm, '_cleanup_inline_state'):
+        tm._cleanup_inline_state()
+    try:
+        tm.send_to_rpc.close()
+    except Exception:
+        pass
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
