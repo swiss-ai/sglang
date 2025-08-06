@@ -1466,12 +1466,20 @@ class Scheduler(
             # Run prefill first if possible
             ret = new_batch
         else:
-            # Run decode
-            if not self.running_batch.is_empty():
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
-            else:
+            # Run decode, but skip if any req is paused without pending_appends
+            # i.e. waiting for resume after append
+            if any(
+                getattr(req, "paused_for_tool", False)
+                and not getattr(req, "pending_appends", None)
+                for req in self.running_batch.reqs
+            ):
                 ret = None
+            else:
+                if not self.running_batch.is_empty():
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    ret = self.running_batch if not self.running_batch.is_empty() else None
+                else:
+                    ret = None
 
         # Handle DP attention
         if need_dp_attn_preparation:
@@ -1491,6 +1499,32 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        # INLINE TOOL APPEND: if any paused-for-tool request has pending tokens, build an extend batch
+        if getattr(self, 'running_batch', None) and self.running_batch.reqs:
+            for req in self.running_batch.reqs:
+                if getattr(req, 'paused_for_tool', False) and getattr(req, 'pending_appends', None):
+                    # Build a one-request prefill-extend batch
+                    batch = ScheduleBatch.init_new(
+                        reqs=[req],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        spec_algorithm=self.spec_algorithm,
+                        enable_custom_logit_processor=self.enable_custom_logit_processor,
+                        chunked_req=None,
+                    )
+                    # Set prefix and extend lengths for the new tokens
+                    # prefix = current output length
+                    prefix_len = len(req.output_ids) if hasattr(req, 'output_ids') else 0
+                    batch.prefix_lens = [prefix_len]
+                    # extend lengths per pending span
+                    extend_lens = [len(span) for span in req.pending_appends]
+                    batch.extend_lens = extend_lens
+                    batch.extend_num_tokens = sum(extend_lens)
+                    batch.is_extend_in_batch = True
+                    return batch
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -2450,6 +2484,39 @@ class Scheduler(
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
+
+    def pause_sequence(self, parameters: dict) -> None:
+        """Pause a running request for inline tool injection."""
+        rid = parameters.get("rid")
+        # mark the matching request paused
+        for batch in (self.running_batch, getattr(self, 'cur_batch', None)):
+            if batch:
+                for req in batch.reqs:
+                    if req.rid == rid:
+                        req.paused_for_tool = True
+                        return
+
+    def enqueue_append_tokens(self, parameters: dict) -> None:
+        """Queue token IDs to append to a paused request."""
+        rid = parameters.get("rid")
+        token_ids = parameters.get("token_ids", [])
+        # append tokens
+        for batch in (self.running_batch, getattr(self, 'cur_batch', None)):
+            if batch:
+                for req in batch.reqs:
+                    if req.rid == rid:
+                        req.pending_appends.append(token_ids)
+                        return
+
+    def resume_sequence(self, parameters: dict) -> None:
+        """Mark a paused sequence ready to resume after append."""
+        rid = parameters.get("rid")
+        for batch in (self.running_batch, getattr(self, 'cur_batch', None)):
+            if batch:
+                for req in batch.reqs:
+                    if req.rid == rid:
+                        req._resume_after_append = True
+                        return
 
 
 class IdleSleeper:

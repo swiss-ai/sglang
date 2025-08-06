@@ -164,6 +164,18 @@ class SchedulerOutputProcessorMixin:
                             )
                             logprob_pt += num_input_logprobs
 
+            # Handle any injected tool tokens: advance grammar and clear pending_appends
+            for req in batch.reqs:
+                if getattr(req, 'pending_appends', None):
+                    for span in req.pending_appends:
+                        for tid in span:
+                            if req.grammar is not None:
+                                req.grammar.accept_token(tid)
+                    req.pending_appends.clear()
+                # If resume was requested after append, unpause
+                if getattr(req, '_resume_after_append', False):
+                    req.paused_for_tool = False
+                    req._resume_after_append = False
             self.set_next_batch_sampling_info_done(batch)
 
         else:  # embedding or reward model

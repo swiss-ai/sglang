@@ -617,6 +617,12 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
+        # Inline tool control state
+        self.paused_for_tool: bool = False
+        from collections import deque
+        self.pending_appends: deque[List[int]] = deque()
+        self._resume_after_append: bool = False
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)

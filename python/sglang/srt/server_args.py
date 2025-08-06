@@ -130,6 +130,10 @@ class ServerArgs:
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # Enable built-in inline tool-call parsing with pause/resume in Engine
+    inline_tool: bool = False
+    # Timeout in seconds to wait for tool response before returning an error
+    tool_timeout: float = 10.0
 
     # Data parallelism
     dp_size: int = 1
@@ -1194,6 +1198,18 @@ class ServerArgs:
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
+        )
+        parser.add_argument(
+            "--inline-tool",
+            action="store_true",
+            default=ServerArgs.inline_tool,
+            help="Enable inline tool-call parsing with pause/resume in synchronous and asynchronous streaming modes (requires --stream)",
+        )
+        parser.add_argument(
+            "--tool-timeout",
+            type=float,
+            default=ServerArgs.tool_timeout,
+            help="Timeout in seconds to wait for tool response before returning an error",
         )
 
         # Data parallelism

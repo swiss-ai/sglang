@@ -149,6 +149,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}. | None |
 | `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'. | None |
+| `--inline-tool` | Enable inline tool-call parsing with pause/resume in synchronous and asynchronous streaming modes (requires `--stream`). | False |
+| `--tool-timeout` | Timeout in seconds to wait for a tool response before returning an error in inline tool-call mode. | 10.0 |
 
 ## Data parallelism
 

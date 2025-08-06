@@ -25,7 +25,8 @@ import multiprocessing as mp
 import os
 import signal
 import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import AsyncIterator, DefaultDict, Dict, Iterator, List, Optional, Tuple, Union
+from collections import deque, defaultdict
 
 import zmq
 import zmq.asyncio
@@ -75,7 +76,78 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.version import __version__
+
+## Inline-tool unified async streamer + sync wrapper
+class _InlineToolEvent:
+    """Resume event that can be awaited in async code and set from any thread."""
+    def __init__(self, timeout: float):
+        self._timeout = timeout
+        self._evt = threading.Event()
+    def set(self):
+        self._evt.set()
+    async def wait(self):
+        """Wait for the resume event, raising asyncio.TimeoutError on timeout."""
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(loop.run_in_executor(None, self._evt.wait), timeout=self._timeout)
+
+async def _inline_tool_stream_async(engine, raw_async_iter, parser):
+    """Single async generator to handle inline tool calls."""
+    rid = None
+    try:
+        async for chunk in raw_async_iter:
+            rid = chunk["meta_info"]["id"]
+            delta = chunk.get("text", "")
+            # Safe parse tool calls
+            try:
+                normal_text, calls = parser.parse_stream_chunk(delta)
+            except Exception as e:
+                # Emit parse error to tool via buffer+resume and continue
+                await engine.append_text_and_resume(rid, f"parse error: {e}", role="tool")
+                yield {"delta": {"role": "tool", "content": f"parse error: {e}"}, "meta_info": chunk["meta_info"]}
+                continue
+            if normal_text:
+                yield {"delta": {"role": "assistant", "content": normal_text}, "meta_info": chunk["meta_info"]}
+            for call in calls:
+                evt = _InlineToolEvent(engine.server_args.tool_timeout)
+                # enqueue per-rid resume event
+                engine._renqueue(rid, "resume", evt)
+                engine.pause_sequence(rid)
+                yield {"delta": {"function_call": {"name": call.name, "arguments": call.parameters}}, "meta_info": chunk["meta_info"]}
+                try:
+                    await evt.wait()
+                except asyncio.TimeoutError:
+                    engine._rpop(rid, "resp")
+                    await engine.append_text_and_resume(rid, f"tool timeout after {engine.server_args.tool_timeout}s", role="tool")
+                    yield {"delta": {"role": "tool", "content": f"tool timeout after {engine.server_args.tool_timeout}s"}, "meta_info": chunk["meta_info"]}
+                else:
+                    role, content = engine._rpop(rid, "resp") or (None, None)
+                    if role is not None:
+                        yield {"delta": {"role": role, "content": content}, "meta_info": chunk["meta_info"]}
+                    else:
+                        await engine.append_text_and_resume(rid, "no tool response provided", role="tool")
+                        yield {"delta": {"role": "tool", "content": "no tool response provided"}, "meta_info": chunk["meta_info"]}
+    finally:
+        if rid:
+            engine._cleanup_inline_state(rid)
+
+def _sync_from_async(async_iter):
+    """Wrap an async iterator into a sync generator by driving it on the current event loop."""
+    def sync_gen():
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                yield loop.run_until_complete(async_iter.__anext__())
+        except StopAsyncIteration:
+            pass
+        finally:
+            close = getattr(async_iter, "aclose", None)
+            if close:
+                loop.run_until_complete(close())
+    return sync_gen()
+
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -133,6 +205,15 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
+        # Lock to protect RPC socket send/recv across threads
+        self._rpc_lock = threading.RLock()
+        # Lock for inline-tool state access
+        self._inline_state_lock = threading.RLock()
+        # per-rid inline-tool queues: resume events and buffered responses
+        self._inline_state: DefaultDict[str, Dict[str, deque]] = defaultdict(lambda: {
+            "resume": deque(),
+            "resp":   deque(),
+        })
 
     def generate(
         self,
@@ -158,6 +239,7 @@ class Engine(EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         stream: bool = False,
+        tools: Optional[List[Tool]] = None,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
@@ -177,6 +259,14 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}"
                 )
 
+        # Warn if inline tool pause/resume requested without streaming
+        if self.server_args.inline_tool:
+            if not stream:
+                logger.warning("inline-tool ignored as sync stream=False")
+            elif tools is None:
+                logger.warning("inline-tool ignored as tools=None")
+            elif self.server_args.tool_call_parser is None:
+                logger.warning("inline-tool ignored as tool_call_parser=None")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -197,23 +287,12 @@ class Engine(EngineBase):
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
         )
-        loop = asyncio.get_event_loop()
-        generator = self.tokenizer_manager.generate_request(obj, None)
-
-        if stream:
-
-            def generator_wrapper():
-                while True:
-                    try:
-                        chunk = loop.run_until_complete(generator.__anext__())
-                        yield chunk
-                    except StopAsyncIteration:
-                        break
-
-            return generator_wrapper()
-        else:
-            ret = loop.run_until_complete(generator.__anext__())
-            return ret
+        raw_async = self.tokenizer_manager.generate_request(obj, None)
+        if stream and self.server_args.inline_tool and tools is not None and self.server_args.tool_call_parser is not None:
+            parser = FunctionCallParser(tools, self.server_args.tool_call_parser)
+            return _sync_from_async(_inline_tool_stream_async(self, raw_async, parser))
+        raw = _sync_from_async(raw_async)
+        return raw if stream else next(raw)
 
     async def async_generate(
         self,
@@ -239,6 +318,7 @@ class Engine(EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         stream: bool = False,
+        tools: Optional[List[Tool]] = None,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
@@ -260,6 +340,14 @@ class Engine(EngineBase):
                 )
 
         logger.info(f"data_parallel_rank: {data_parallel_rank}")
+        # Warn if inline tool pause/resume requested without streaming
+        if self.server_args.inline_tool:
+            if not stream:
+                logger.warning("inline-tool ignored as async stream=False")
+            elif tools is None:
+                logger.warning("inline-tool ignored as tools=None")
+            elif self.server_args.tool_call_parser is None:
+                logger.warning("inline-tool ignored as tool_call_parser=None")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -280,12 +368,11 @@ class Engine(EngineBase):
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
         )
-        generator = self.tokenizer_manager.generate_request(obj, None)
-
-        if stream is True:
-            return generator
-        else:
-            return await generator.__anext__()
+        raw_async = self.tokenizer_manager.generate_request(obj, None)
+        if stream and self.server_args.inline_tool and tools is not None and self.server_args.tool_call_parser is not None:
+            parser = FunctionCallParser(tools, self.server_args.tool_call_parser)
+            return _inline_tool_stream_async(self, raw_async, parser)
+        return raw_async if stream else raw_async.__anext__()
 
     def encode(
         self,
@@ -347,6 +434,14 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        # Signal any pending inline-tool resume events and clean up state to avoid hanging generators
+        with self._inline_state_lock:
+            for state_map in self._inline_state.values():
+                for evt_queue in state_map.values():
+                    for evt in evt_queue:
+                        evt.set()
+            self._cleanup_inline_state()
+        # Shutdown child processes
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
@@ -528,6 +623,71 @@ class Engine(EngineBase):
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
+
+    def pause_sequence(self, rid: str, reason: str = "tool"):  # inline tool control
+        """Pause a running sequence in the scheduler."""
+        from sglang.srt.managers.io_struct import RpcReqInput
+
+        req = RpcReqInput(method="pause_sequence", parameters={"rid": rid, "reason": reason})
+        # protect socket usage
+        with self._rpc_lock:
+            self.send_to_rpc.send_pyobj(req)
+            resp = self.send_to_rpc.recv_pyobj()
+        return resp
+
+    def append_text_and_resume(self, rid: str, text: Union[str, List[int]], *, role: str = None):
+        """Append token_ids (or raw text) and resume decode inline."""
+        from sglang.srt.managers.io_struct import RpcReqInput
+
+        # If text is raw string, encode it; else assume token list
+        token_ids = (
+            text if isinstance(text, list) else self.tokenizer_manager.tokenizer.encode(text)
+        )
+        # record tool response content and buffer it
+        resp_txt = text if isinstance(text, str) else self.tokenizer_manager.tokenizer.decode(text)
+        # buffer role and content for both sync and async
+        role_to_use = role or "tool"
+        # buffer one response for the next resume
+        self._renqueue(rid, "resp", (role_to_use, resp_txt))
+        # Enqueue append
+        enqueue_req = RpcReqInput(method="enqueue_append_tokens", parameters={"rid": rid, "token_ids": token_ids})
+        with self._rpc_lock:
+            self.send_to_rpc.send_pyobj(enqueue_req)
+            _ = self.send_to_rpc.recv_pyobj()
+        # Resume
+        resume_req = RpcReqInput(method="resume_sequence", parameters={"rid": rid})
+        with self._rpc_lock:
+            self.send_to_rpc.send_pyobj(resume_req)
+            _ = self.send_to_rpc.recv_pyobj()
+        # wake the next resume event
+        if evt := self._rpop(rid, "resume"):
+            evt.set()
+        return True
+
+    def _cleanup_inline_state(self, rid: Optional[str] = None):
+        """Clear inline-tool state(s)."""
+        with self._inline_state_lock:
+            if rid:
+                self._inline_state.pop(rid, None)
+            else:
+                self._inline_state.clear()
+
+    def _renqueue(self, rid: str, name: str, item) -> None:
+        """Append an item to the per-rid `<name>` queue."""
+        with self._inline_state_lock:
+            self._inline_state[rid][name].append(item)
+
+    def _rpop(self, rid: str, name: str):
+        """Pop and return next item from the per-rid `<name>` queue, or None."""
+        with self._inline_state_lock:
+            q = self._inline_state[rid][name]
+            if q:
+                elem = q.popleft()
+                # clean up empty rid-entry
+                if not any(self._inline_state[rid].values()):
+                    del self._inline_state[rid]
+                return elem
+        return None
 
     """
     Execute an RPC call on all scheduler processes.
