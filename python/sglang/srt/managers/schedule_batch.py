@@ -1529,7 +1529,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.grammar is not None:
                 jump_helper = req.grammar.try_jump_forward(req.tokenizer)
                 if jump_helper:
-                    print(f"Jump forward for request {req.rid}: {jump_helper}")
                     suffix_ids, _ = jump_helper
 
                     # Current ids, for cache and revert
