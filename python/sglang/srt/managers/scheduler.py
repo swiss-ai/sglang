@@ -1540,8 +1540,8 @@ class Scheduler(
             )
 
         # Check for jump-forward
-        logger.debug(f"checking for jump-forward: {not self.disable_jump_forward and batch.has_grammar}")
-        
+        logger.debug(f"checking for jump-forward: {not self.disable_jump_forward} and {batch.has_grammar}")
+
         if not self.disable_jump_forward and batch.has_grammar:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self._extend_requests_to_queue(jump_forward_reqs)
