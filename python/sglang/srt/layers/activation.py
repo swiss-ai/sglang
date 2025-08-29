@@ -165,8 +165,8 @@ class XIELU(CustomOp):
                 torch.exp(torch.tensor(alpha_n_init - beta, dtype=dtype)) - 1
             ).unsqueeze(0)
         )
-        self.register_buffer("beta", torch.tensor(beta, dtype=dtype))
-        self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
+        self.register_buffer("beta", torch.tensor(beta, dtype=dtype), persistent=False)
+        self.register_buffer("eps", torch.tensor(eps, dtype=dtype), persistent=False)
         self.with_vector_loads = with_vector_loads
         # Temporary until xIELU CUDA fully implemented
         self._beta_scalar = float(self.beta.detach().cpu().float().item())

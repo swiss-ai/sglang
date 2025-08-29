@@ -90,7 +90,7 @@ ALL_MODELS = [
         skip_long_prompt=True,
     ),
     ModelCase(
-        "swiss-ai/Apertus-8B",
+        "swiss-ai/SwissAI-8B",
         trust_remote_code=True,
         skip_long_prompt=True,
     ),

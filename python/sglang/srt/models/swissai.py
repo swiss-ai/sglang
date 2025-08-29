@@ -15,14 +15,14 @@
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-"""Inference-only Apertus model compatible with HuggingFace weights."""
+"""Inference-only SwissAI model compatible with HuggingFace weights."""
 
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import ApertusConfig
+from transformers import SwissAIConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -59,7 +59,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-class ApertusMLP(nn.Module):
+class SwissAIMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -109,10 +109,10 @@ class ApertusMLP(nn.Module):
         return x
 
 
-class ApertusAttention(nn.Module):
+class SwissAIAttention(nn.Module):
     def __init__(
         self,
-        config: ApertusConfig,
+        config: SwissAIConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -208,10 +208,10 @@ class ApertusAttention(nn.Module):
         return output
 
 
-class ApertusDecoderLayer(nn.Module):
+class SwissAIDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: ApertusConfig,
+        config: SwissAIConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -237,7 +237,7 @@ class ApertusDecoderLayer(nn.Module):
         # support internlm/internlm3-8b with qkv_bias
         if hasattr(config, "qkv_bias"):
             attention_bias = config.qkv_bias
-        self.self_attn = ApertusAttention(
+        self.self_attn = SwissAIAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -252,7 +252,7 @@ class ApertusDecoderLayer(nn.Module):
             bias=attention_bias,
             bias_o_proj=bias_o_proj,
         )
-        self.mlp = ApertusMLP(
+        self.mlp = SwissAIMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -290,10 +290,10 @@ class ApertusDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class ApertusModel(nn.Module):
+class SwissAIModel(nn.Module):
     def __init__(
         self,
-        config: ApertusConfig,
+        config: SwissAIConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -316,7 +316,7 @@ class ApertusModel(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: ApertusDecoderLayer(
+            lambda idx, prefix: SwissAIDecoderLayer(
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             pp_rank=self.pp_group.rank_in_group,
@@ -403,7 +403,7 @@ class ApertusModel(nn.Module):
                 )
 
 
-class ApertusForCausalLM(nn.Module):
+class SwissAIForCausalLM(nn.Module):
     # LoRA specific attributes
     embedding_modules = {
         "embed_tokens": "input_embeddings",
@@ -430,7 +430,7 @@ class ApertusForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: ApertusConfig,
+        config: SwissAIConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -462,11 +462,11 @@ class ApertusForCausalLM(nn.Module):
 
     def _init_model(
         self,
-        config: ApertusConfig,
+        config: SwissAIConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        return ApertusModel(config, quant_config=quant_config, prefix=prefix)
+        return SwissAIModel(config, quant_config=quant_config, prefix=prefix)
 
     @torch.no_grad()
     def forward(
@@ -679,4 +679,4 @@ class ApertusForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = [ApertusForCausalLM]
+EntryClass = [SwissAIForCausalLM]
